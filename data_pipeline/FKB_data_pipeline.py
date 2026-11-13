@@ -1,6 +1,4 @@
 import os
-from typing import Dict
-
 import geopandas as gpd
 import laspy
 import numpy as np
@@ -49,6 +47,36 @@ def load_fkb_data(
         "Mønelinje": monelinje,
         "Bygningslinje": bygningslinje,
     }
+
+def bygningslinje_match(
+    bygningslinje_lines: gpd.GeoDataFrame,
+    takkant_lines: gpd.GeoDataFrame,
+    tolerance: float = 0.05,
+) -> gpd.GeoDataFrame:
+    """
+    returns the monelinje lines that are within a certain tolerance of the takkant lines.
+    """
+
+    if bygningslinje_lines.empty or takkant_lines.empty:
+        return bygningslinje_lines.iloc[0:0].copy()
+    
+    takkant_polygons = takkant_lines.geometry.polygonize(
+        node=True
+    )
+    if takkant_polygons.empty:
+        return bygningslinje_lines.iloc[0:0].copy()
+
+    roof_geometry = takkant_polygons.union_all()
+
+    roof_search_area = roof_geometry.buffer(tolerance)
+
+    mask = bygningslinje_lines.geometry.intersects(
+        roof_search_area
+    )
+
+    return bygningslinje_lines.loc[mask].copy()
+
+    
 def monelinje_match(
     monelinje_lines: gpd.GeoDataFrame,
     takkant_lines: gpd.GeoDataFrame,
@@ -198,14 +226,6 @@ def filter_fkb_data(
             predicate="intersects",
         )
 
-
-        bygningslinje_indices = (
-            bygningslinje_tree.query(
-                lidar_bbox,
-                predicate="intersects",
-            )
-        )
-
         takkant_candidates = takkant.iloc[
             takkant_candidate_indices
         ].copy()
@@ -224,16 +244,23 @@ def filter_fkb_data(
             monelinje.iloc[monelinje_indices],
             matched_takkant,
         )
-        
+
+        bygningslinje_indices = bygningslinje_tree.query(
+                lidar_bbox,
+                predicate="intersects",
+        )
+    
+        matched_bygningslinje = bygningslinje_match(
+            bygningslinje.iloc[bygningslinje_indices],
+            matched_takkant,
+        )
 
         filtered_fkb[file] = {
             "lidar": las,
             "bbox": lidar_bbox,
             "takkant": matched_takkant,
             "monelinje": matched_monelinje,
-            "bygningslinje": bygningslinje.iloc[
-                bygningslinje_indices
-            ].copy(),
+            "bygningslinje": matched_bygningslinje
         }
 
     return filtered_fkb
