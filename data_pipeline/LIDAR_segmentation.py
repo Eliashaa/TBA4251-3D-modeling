@@ -25,7 +25,7 @@ def point_plane_distance(points, plane):
 
 def ransac_plane(points, iterations= 1000, threshold = 0.15):
     best_plane = None
-    best_inliers = np.Array([],dtype=int)
+    best_inliers = np.array([],dtype=int)
 
     for _ in iterations: 
         random_indices = np.random.choice(len(points), 3, replace=False)
