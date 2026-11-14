@@ -142,8 +142,6 @@ def takkant_match(
             lidar_bbox.centroid
         )
 
-        # max() velger høyest overlapp først.
-        # Ved lik overlapp velges kortest avstand.
         return overlap_score, -centroid_distance
 
     best_polygon = max(
