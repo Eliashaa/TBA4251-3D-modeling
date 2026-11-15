@@ -11,12 +11,10 @@ def plane_from_points(p1, p2, p3):
     d = -np.dot(normal, p1)
     return np.array([*normal, d])
 
-
 def point_plane_distance(points, plane):
     """Vinkelrett avstand fra hvert 3D-punkt til planet."""
     normal = plane[:3]
     return np.abs(points @ normal + plane[3]) / np.linalg.norm(normal)
-
 
 def ransac_plane(points, iterations=1000, threshold=0.10, rng=None,
                  min_abs_normal_z=0.1):
