@@ -112,36 +112,16 @@ def snap_geometries(
 
 
 def segment_rooftiles(
-    fkb_data: dict[str, object],
+    monelinje: gpd.GeoDataFrame,
+    bygningslinje: gpd.GeoDataFrame,
+    takkant: gpd.GeoDataFrame,
     tolerance: float = 0.3,
 ) -> gpd.GeoSeries:
-    """Create roof polygons from roof edges, ridge lines and building lines."""
-    takkant = fkb_data.get("takkant")
-    if not isinstance(takkant, gpd.GeoDataFrame) or takkant.empty:
-        return gpd.GeoSeries(
-            [],
-            dtype="geometry",
-            crs=getattr(takkant, "crs", None),
-        )
-
+    """Return polygon sections cut by snapped ridge and building lines."""
     takkant_lines = _as_2d_lines(takkant.geometry)
     roof_polygons = takkant_lines.polygonize(node=True)
     if roof_polygons.empty:
         return roof_polygons
-
-    def empty_lines() -> gpd.GeoDataFrame:
-        return gpd.GeoDataFrame(
-            geometry=gpd.GeoSeries([], dtype="geometry", crs=takkant.crs),
-            crs=takkant.crs,
-        )
-
-    monelinje = fkb_data.get("monelinje")
-    if not isinstance(monelinje, gpd.GeoDataFrame):
-        monelinje = empty_lines()
-
-    bygningslinje = fkb_data.get("bygningslinje")
-    if not isinstance(bygningslinje, gpd.GeoDataFrame):
-        bygningslinje = empty_lines()
 
     snappet_mone, snappet_bygning = snap_geometries(
         monelinje,
@@ -150,18 +130,19 @@ def segment_rooftiles(
         tolerance=tolerance,
     )
 
-    linework = gpd.GeoSeries(
+    cutters = gpd.GeoSeries(
         [
-            *takkant_lines.tolist(),
             *snappet_mone.geometry.tolist(),
             *snappet_bygning.geometry.tolist(),
         ],
         crs=takkant.crs,
     )
-    linework = linework[linework.notna() & ~linework.is_empty]
-    segmented = linework.polygonize(node=True)
+    sections = []
+    for roof in roof_polygons:
+        intersecting = cutters[cutters.intersects(roof)]
+        clipped = intersecting.intersection(roof)
+        linework = gpd.GeoSeries([roof.boundary, *clipped], crs=takkant.crs)
+        faces = linework.polygonize(node=True)
+        sections.extend(face for face in faces if roof.covers(face.representative_point()))
 
-    # Discard polygons created by linework outside the original roof outline.
-    roof_area = roof_polygons.union_all()
-    inside_roof = segmented.representative_point().apply(roof_area.covers)
-    return segmented.loc[inside_roof].reset_index(drop=True)
+    return gpd.GeoSeries(sections, crs=takkant.crs)
