@@ -1,4 +1,6 @@
+import geopandas as gpd
 import numpy as np
+from shapely import points as xy_points
 
 
 def plane_from_points(p1, p2, p3):
@@ -100,3 +102,57 @@ def segment_planes(points, min_points=30, iterations=1000, threshold=0.15,
         remaining_indices = np.delete(remaining_indices, inliers)
 
     return segments
+
+
+def match_lidar_planes_to_segments(
+    planes,
+    roof_segments: gpd.GeoSeries,
+    *,
+    min_points: int = 3,
+    min_support_fraction: float = 0.5,
+) -> dict[int, dict[str, object]]:
+    """Match each roof polygon to the plane with the most LiDAR inliers inside it.
+
+    Use planes from segment_planes() and faces from segment_rooftiles().
+    LiDAR XY and polygon coordinates must use the same CRS. Points on a shared
+    boundary count for each touching face. A plane can match multiple faces.
+    Support fraction is the winning plane's share of classified points inside
+    the face. Results are keyed by zero-based roof segment position. Ties and
+    insufficient support leave both plane and plane_index set to None.
+    """
+    if min_points < 1 or not 0 <= min_support_fraction <= 1:
+        raise ValueError("Require min_points >= 1 and min_support_fraction in [0, 1].")
+
+    counts = np.zeros((len(roof_segments), len(planes)), dtype=int)
+    spatial_index = roof_segments.sindex
+    for plane_index, plane in enumerate(planes):
+        points = np.asarray(plane["points"], dtype=float)
+        if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+            raise ValueError(f"Plane {plane_index} must contain finite (N, 3) points.")
+
+        _, face_positions = spatial_index.query(
+            xy_points(points[:, :2]), predicate="intersects"
+        )
+        counts[:, plane_index] = np.bincount(face_positions, minlength=len(roof_segments))
+
+    matches = {}
+    for position, (segment, votes) in enumerate(zip(roof_segments, counts)):
+        total = votes.sum()
+        best_index = int(votes.argmax()) if total else None
+        best_count = int(votes[best_index]) if best_index is not None else 0
+        fraction = best_count / total if total else 0.0
+        if (
+            best_count < min_points
+            or fraction < min_support_fraction
+            or np.count_nonzero(votes == best_count) != 1
+        ):
+            best_index = None
+        matches[position] = {
+            "roof_segment": segment,
+            "plane": planes[best_index]["plane"] if best_index is not None else None,
+            "plane_index": best_index,
+            "support_points": best_count,
+            "support_fraction": float(fraction),
+        }
+
+    return matches
