@@ -19,7 +19,8 @@ def point_plane_distance(points, plane):
     return np.abs(points @ normal + plane[3]) / np.linalg.norm(normal)
 
 def ransac_plane(points, iterations=1000, threshold=0.10, rng=None,
-                 min_abs_normal_z=0.1):
+                 min_abs_normal_z=0.1, *, min_sample_area=0.0, xy_bins=None,
+                 min_inliers=3, min_coverage=0.0):
     """Returner (inlier-indekser, planparametere) for beste takplan."""
     points = np.asarray(points, dtype=float)
     if len(points) < 3:
@@ -29,17 +30,31 @@ def ransac_plane(points, iterations=1000, threshold=0.10, rng=None,
 
     best_inliers = np.array([], dtype=int)
     best_plane = None
+    best_score = None
+    occupied_bins = np.unique(xy_bins).size if xy_bins is not None else 1
 
     for _ in range(iterations):
         indices = rng.choice(len(points), size=3, replace=False)
+        if min_sample_area:
+            u, v = points[indices[1:], :2] - points[indices[0], :2]
+            if abs(u[0] * v[1] - u[1] * v[0]) < 2 * min_sample_area:
+                continue
         plane = plane_from_points(*points[indices])
         if plane is None or abs(plane[2]) < min_abs_normal_z:
             continue
 
-        inliers = np.flatnonzero(point_plane_distance(points, plane) < threshold)
-        if len(inliers) > len(best_inliers):
+        distances = point_plane_distance(points, plane)
+        inliers = np.flatnonzero(distances < threshold)
+        if len(inliers) < min_inliers:
+            continue
+        coverage = np.unique(xy_bins[inliers]).size / occupied_bins if xy_bins is not None else 1.0
+        if coverage < min_coverage:
+            continue
+        score = (len(inliers) * np.sqrt(coverage), -np.mean(distances[inliers] ** 2))
+        if best_score is None or score > best_score:
             best_inliers = inliers
             best_plane = plane
+            best_score = score
 
     return best_inliers, best_plane
 
@@ -102,6 +117,72 @@ def segment_planes(points, min_points=30, iterations=1000, threshold=0.15,
         remaining_indices = np.delete(remaining_indices, inliers)
 
     return segments
+
+
+def fit_lidar_planes_by_roof_segment(
+    points, roof_segments: gpd.GeoSeries, *, threshold: float = 0.15,
+    min_points: int = 10, min_support_fraction: float = 0.5,
+    min_coverage: float = 0.5,
+) -> dict[int, dict[str, object]]:
+    """Fit a plane independently inside each roof polygon in the LiDAR XY CRS."""
+    points = np.asarray(points, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+        raise ValueError("Expected finite LiDAR points with shape (N, 3).")
+    if min_points < 3 or threshold <= 0 or not (
+        0 < min_support_fraction <= 1 and 0 <= min_coverage <= 1
+    ):
+        raise ValueError("Invalid roof plane fitting parameters.")
+
+    tree = gpd.GeoSeries(xy_points(points[:, :2]), crs=roof_segments.crs).sindex
+    rng = np.random.default_rng(42)
+    matches = {}
+    for position, roof in enumerate(roof_segments):
+        local = points[tree.query(roof, predicate="contains", sort=True)]
+        plane = None
+        support = 0
+        fraction = coverage = 0.0
+        status = "too few interior returns"
+        if len(local) >= min_points:
+            low = np.array(roof.bounds[:2])
+            span = np.array(roof.bounds[2:]) - low
+            grid = np.clip(((local[:, :2] - low) / span * 4).astype(int), 0, 3)
+            bins = 4 * grid[:, 0] + grid[:, 1]
+            occupied = np.unique(bins).size
+            required = max(min_points, int(np.ceil(min_support_fraction * len(local))))
+            inliers, candidate = ransac_plane(
+                local, threshold=threshold, rng=rng, min_abs_normal_z=0.2,
+                min_sample_area=0.005 * roof.area, xy_bins=bins,
+                min_inliers=required, min_coverage=min_coverage,
+            )
+            status = "no candidate met slope, support and coverage requirements"
+            if candidate is not None:
+                plane = candidate
+                status = "fitted"
+                for _ in range(2):
+                    refined = fit_plane_pca(local[inliers])
+                    updated = np.flatnonzero(point_plane_distance(local, refined) < threshold)
+                    if (abs(refined[2]) < 0.2 or len(updated) < required
+                            or np.unique(bins[updated]).size / occupied < min_coverage):
+                        break
+                    plane = refined
+                    if np.array_equal(updated, inliers):
+                        break
+                    inliers = updated
+                support = len(inliers)
+                fraction = support / len(local)
+                coverage = np.unique(bins[inliers]).size / occupied
+
+        matches[position] = {
+            "roof_segment": roof,
+            "plane": plane,
+            "plane_index": position if plane is not None else None,
+            "interior_points": len(local),
+            "support_points": support,
+            "support_fraction": fraction,
+            "coverage": coverage,
+            "status": status,
+        }
+    return matches
 
 
 def match_lidar_planes_to_segments(
