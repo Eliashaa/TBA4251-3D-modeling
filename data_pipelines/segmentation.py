@@ -162,7 +162,4 @@ def segment_rooftiles(
         unused_lines.extend(dangles.geoms)
         unused_lines.extend(cut_edges.geoms)
 
-    return (
-        gpd.GeoSeries(sections, crs=takkant.crs),
-        gpd.GeoSeries(unused_lines, crs=takkant.crs),
-    )
+    return gpd.GeoSeries(sections, crs=takkant.crs), gpd.GeoSeries(unused_lines, crs=takkant.crs),
