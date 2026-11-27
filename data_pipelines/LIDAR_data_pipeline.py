@@ -1,6 +1,139 @@
+from itertools import combinations
+
 import geopandas as gpd
 import numpy as np
 from shapely import points as xy_points
+from shapely.geometry import LineString
+from shapely.ops import split, triangulate
+
+
+def align_roof_ridges(matches, *, max_reassigned_fraction=0.2):
+    """Move a shared ridge onto the fitted intersection when the footprint supports it."""
+    aligned = {face_id: result.copy() for face_id, result in matches.items()}
+    fitted = [face_id for face_id, result in aligned.items() if result['plane'] is not None]
+    for position, first in enumerate(fitted):
+        for second in fitted[position + 1:]:
+            face_a, face_b = aligned[first], aligned[second]
+            roof_a, roof_b = face_a['roof_segment'], face_b['roof_segment']
+            if roof_a.boundary.intersection(roof_b.boundary).length < 1e-6:
+                continue
+            combined = roof_a.union(roof_b)
+            if combined.geom_type != 'Polygon':
+                continue
+            center = np.asarray(combined.centroid.coords[0])
+            a, b = np.asarray(face_a['plane']), np.asarray(face_b['plane'])
+            slope = b[:2] / b[2] - a[:2] / a[2]
+            normal_length = np.linalg.norm(slope)
+            if normal_length < 1e-8:
+                continue
+            height_difference = -(center @ a[:2] + a[3]) / a[2] + (
+                center @ b[:2] + b[3]
+            ) / b[2]
+            normal = slope / normal_length
+            ridge_point = center - normal * height_difference / normal_length
+            direction = np.array([-normal[1], normal[0]])
+            low_x, low_y, high_x, high_y = combined.bounds
+            reach = 2 * np.hypot(high_x - low_x, high_y - low_y)
+            pieces = list(split(combined, LineString([
+                ridge_point - reach * direction, ridge_point + reach * direction
+            ])).geoms)
+            if len(pieces) != 2:
+                continue
+            pieces.sort(key=lambda piece: piece.intersection(roof_a).area, reverse=True)
+            # Limit changes against the input footprint, including earlier ridge moves.
+            if any(
+                piece.symmetric_difference(matches[face_id]['roof_segment']).area
+                > max_reassigned_fraction * matches[face_id]['roof_segment'].area
+                for face_id, piece in zip((first, second), pieces)
+            ):
+                continue
+            face_a['roof_segment'], face_b['roof_segment'] = pieces
+    return aligned
+
+
+def build_roof_mesh_vertices(matches, *, max_height_adjustment=0.075):
+    """Join compatible roof planes while bounding changes to each fitted face."""
+    triangles_by_face = {}
+    for face_id, result in matches.items():
+        if result['plane'] is None:
+            continue
+        roof = result['roof_segment']
+        vertices = []
+        for triangle in triangulate(roof):
+            clipped = triangle.intersection(roof)
+            for piece in getattr(clipped, 'geoms', (clipped,)):
+                if piece.geom_type == 'Polygon' and not piece.is_empty:
+                    for face in triangulate(piece):
+                        if piece.covers(face):
+                            vertices.extend(face.exterior.coords[:3])
+        if not vertices:
+            continue
+
+        triangles_by_face[face_id] = vertices
+
+    if not triangles_by_face:
+        return {}
+
+    face_ids = list(triangles_by_face)
+    origin = np.mean(np.vstack(list(triangles_by_face.values())), axis=0)
+    columns = {face_id: slice(3 * i, 3 * i + 3) for i, face_id in enumerate(face_ids)}
+    size = 3 * len(face_ids)
+    constraints = []
+    for first, second in combinations(face_ids, 2):
+        shared = matches[first]['roof_segment'].boundary.intersection(
+            matches[second]['roof_segment'].boundary
+        )
+        for edge in getattr(shared, 'geoms', (shared,)):
+            if edge.geom_type != 'LineString' or edge.length < 1e-6:
+                continue
+            edge_rows = []
+            for xy in edge.coords:
+                row = np.zeros(size)
+                basis = [*(np.asarray(xy) - origin), 1]
+                row[columns[first]] = basis
+                row[columns[second]] = -np.asarray(basis)
+                edge_rows.append(row)
+            constraints.append(edge_rows)
+
+    samples, targets, bases = [], [], {}
+    for face_id, vertices in triangles_by_face.items():
+        xy = np.asarray(vertices)
+        bases[face_id] = np.column_stack((xy - origin, np.ones(len(xy))))
+        support = np.unique(xy, axis=0)
+        a, b, c, d = matches[face_id]['plane']
+        target = -(support @ [a, b] + d) / c
+        rows = np.zeros((len(support), size))
+        rows[:, columns[face_id]] = np.column_stack(
+            (support - origin, np.ones(len(support)))
+        )
+        samples.append(rows)
+        targets.append(target)
+
+    design = np.vstack(samples)
+    heights = np.concatenate(targets)
+    original = np.linalg.lstsq(design, heights, rcond=None)[0]
+
+    def solve_seams(rows):
+        matrix = np.asarray(rows)
+        _, singular, right = np.linalg.svd(matrix, full_matrices=True)
+        rank = np.count_nonzero(singular > singular[0] * max(matrix.shape) * np.finfo(float).eps)
+        feasible = right[rank:].T
+        return feasible @ np.linalg.lstsq(design @ feasible, heights, rcond=None)[0]
+
+    coefficients = original
+    accepted = []
+    for edge_rows in sorted(constraints, key=lambda rows: np.max(np.abs(rows @ original))):
+        if np.max(np.abs(edge_rows @ original)) > 2 * max_height_adjustment:
+            continue
+        candidate_rows = accepted + edge_rows
+        candidate = solve_seams(candidate_rows)
+        if np.max(np.abs(design @ candidate - heights)) <= max_height_adjustment + 1e-9:
+            accepted = candidate_rows
+            coefficients = candidate
+    return {
+        face_id: np.column_stack((vertices, bases[face_id] @ coefficients[columns[face_id]]))
+        for face_id, vertices in triangles_by_face.items()
+    }
 
 
 def plane_from_points(p1, p2, p3):
@@ -182,6 +315,26 @@ def fit_lidar_planes_by_roof_segment(
             "coverage": coverage,
             "status": status,
         }
+    # Sparse cells can extend an existing adjacent plane when their returns support it.
+    fitted = [result for result in matches.values() if result["plane"] is not None]
+    for position, result in matches.items():
+        if result["status"] != "too few interior returns" or result["interior_points"] < 3:
+            continue
+        roof = result["roof_segment"]
+        local = points[tree.query(roof, predicate="contains", sort=True)]
+        candidates = []
+        for neighbor in fitted:
+            if roof.boundary.intersection(neighbor["roof_segment"].boundary).length <= 1e-6:
+                continue
+            support = np.count_nonzero(point_plane_distance(local, neighbor["plane"]) < threshold)
+            if support >= max(3, np.ceil(0.75 * len(local))):
+                candidates.append((neighbor["plane"], support))
+        if len(candidates) == 1:
+            plane, support = candidates[0]
+            result.update(
+                plane=plane, plane_index=position, support_points=support,
+                support_fraction=support / len(local), status="supported adjacent plane",
+            )
     return matches
 
 
